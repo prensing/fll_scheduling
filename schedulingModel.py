@@ -92,14 +92,16 @@ class Team(object):
         return self.name
 
     def addEvent(self, evt, slot):
-        self.schedule.append((evt, slot))
+        self.schedule.append([evt, slot])  # use a list so we can swap slots later
         return
 
     def __lt__(self, other):
         if type(other) != type(self):
             raise TypeError
-
         return self.teamNumber < other.teamNumber
+
+    def __str__(self):
+        return str(self.teamNumber)
 
     def travelTime(self):
         minTravel = 10000
@@ -110,6 +112,36 @@ class Team(object):
                 minTravel = min(minTravel, dt)
             prevET = evt.endTime()
         return minTravel
+
+    def inventoryTables(self):
+        '''Inventory tables the team uses'''
+
+        tables = {}
+        for evt, slot in self.schedule:
+            if isinstance(evt, Match):
+                tbl = evt.tableName(slot)
+                tables.setdefault(tbl, []).append(evt)
+        return tables
+
+    def countDuplicateTables(self):
+        '''Count the number of duplicate tables the team uses'''
+
+        return sum([len(t) - 1 for t in self.inventoryTables().values()])
+
+    def minimizeDuplicateTables(self):
+        tbls = self.inventoryTables()
+        matchsets = sorted(tbls.values(), key=lambda t: len(t), reverse=True)
+
+        swapped = False
+        for mlist in matchsets:
+            if len(mlist) == 1:
+                break
+            for match in mlist:
+                if match.trySwapTeams():
+                    swapped = True
+                    break
+
+        return swapped
 
     def outputSchedule(self, outCSV):
         outCSV.writerow((self.teamNumber, self.name))
@@ -122,7 +154,8 @@ class Team(object):
 @functools.total_ordering
 class TimeSlot(object):
     travelTime = 0
-    timeBlockBoundaries = {}
+    timeBlockBoundaries = []
+    timeBlock2Index = {}
 
     def __init__(self, index, startT, endT):
         self.index = index
@@ -133,13 +166,14 @@ class TimeSlot(object):
 
     @classmethod
     def setTimeBlocks(cls, alltimes):
-        cls.timeBlockBoundaries = {t: i for i, t in enumerate(sorted(alltimes))}
+        cls.timeBlockBoundaries = list(sorted(alltimes))
+        cls.timeBlock2Index = {t: i for i, t in enumerate(cls.timeBlockBoundaries)}
         return
 
     @classmethod
     def numTimeBlocks(cls):
         # 1 less because we are counting regions. timeBlockBoundaries holds the edges
-        return len(cls.timeBlockBoundaries) - 1
+        return len(cls.timeBlock2Index) - 1
 
     def startTime(self):
         return self._startT
@@ -150,7 +184,7 @@ class TimeSlot(object):
         return self._endT
 
     def timeBlockRange(self, padded=False):
-        return range(self.timeBlockBoundaries[self._startT], self.timeBlockBoundaries[self.endTime(padded)])
+        return range(self.timeBlock2Index[self._startT], self.timeBlock2Index[self.endTime(padded)])
 
     def __eq__(self, other):
         if not isinstance(other, TimeSlot):
@@ -375,13 +409,48 @@ class Match(TimeSlot):
                 return
         raise Exception("Too many teams for match slots")
 
+    def __eq__(self, other):
+        if type(other) != type(self):
+            raise TypeError("Unsupported type %s" % type(other))
+
+        return self.index == other.index and self.table == other.table
+
     def __str__(self):
-        args = [self.index, self.startT, self.endT, self.table]
+        args = [self.index, self.startTime(), self.endTime(), self.table]
         args.extend(self.teams)
         return ' '.join([str(x) for x in args])
 
     def tableName(self, slot):
         return '{} {}'.format(self.table, slot+1)
+
+    def swapTeams(self):
+        '''Swap the team slots'''
+        t0 = self.teams[0]
+        t1 = self.teams[1]
+        self.teams[0] = t1
+        self.teams[1] = t0
+        # make sure to change the entries in the team
+        for e in t0.schedule:
+            if e[0] == self:
+                e[1] = 1
+                break
+        for e in t1.schedule:
+            if e[0] == self:
+                e[1] = 0
+                break
+        return
+
+    def trySwapTeams(self):
+        '''Try to swap the team slots to reduce table duplication in the teams'''
+
+        cnts_start = [t.countDuplicateTables() for t in self.teams]
+        self.swapTeams()
+        cnts_end = [t.countDuplicateTables() for t in self.teams]
+        if max(cnts_end) < max(cnts_start) or sum(cnts_end) < sum(cnts_start):
+            # success
+            return True
+        self.swapTeams()
+        return False
 
     def outputTeamSchedule(self, slot, outCSV):
         outCSV.writerow(('Match {}'.format(self.matchNum), self.tableName(slot), self.startTime(), self.endTime()))
@@ -808,24 +877,28 @@ class ScheduleModel(object):
 
         print('param judgeEventTimes :=')
         first = True
+        commentStr = ''
         for name, event in self.judgeEvents.items():
             for s in event.sessions:
                 for t in s.timeBlockRange(padded=True):
                     if not first:
-                        print(',')
+                        print(',  # %s' % commentStr)
                     print("      [%d,%d,%d] 1" % (event.index, s.index, t), end='')
+                    commentStr = str(TimeSlot.timeBlockBoundaries[t])
                     first = False
-        print(';')
+        print(';  # %s' % commentStr)
 
         print('param matchTimes :=')
         first = True
+        commentStr = ''
         for match in self.matchList.matches:
             for t in match.timeBlockRange(padded=True):
                 if not first:
-                    print(',')
+                    print(',  # %s' % commentStr)
                 print("      [%d,%d] 1" % (match.index, t), end='')
+                commentStr = str(TimeSlot.timeBlockBoundaries[t])
                 first = False
-        print(';')
+        print(';  # %s' % commentStr)
 
         print('end;')
 
@@ -844,6 +917,8 @@ class ScheduleModel(object):
         with open(results) as infile:
             self.readResults(infile)
 
+        self.minimizeDuplicateTables()
+
         fname = '{}_matches.csv'.format(outputBase)
         with open(fname, 'w') as outfile:
             self.matchList.outputSchedule(outfile)
@@ -854,14 +929,18 @@ class ScheduleModel(object):
                 judgeEvt.outputSchedule(outfile)
 
         fname = '{}_teams.csv'.format(outputBase)
+        totalDuplicateTables = 0
         with open(fname, 'w') as outfile:
             outCSV = csv.writer(outfile)
 
             for team in sorted(self.teams):
-                print('Team {} min travel = {}'.format(team.teamNumber, team.travelTime()))
+                d = team.countDuplicateTables()
+                totalDuplicateTables += d
+                print('Team {} min travel = {} duplicate tables = {}'.format(team.teamNumber, team.travelTime(), d))
                 team.outputSchedule(outCSV)
                 outCSV.writerow(())
 
+        print('Total duplicate tables =', totalDuplicateTables)
         return
 
     def readResults(self, infile):
@@ -894,6 +973,18 @@ class ScheduleModel(object):
                         session = self.findJudgeEvent(evtInd).findSession(sessInd)
                         session.assignTeam(self.findTeam(int(m.group('i3'))))
 
+        return
+
+    def minimizeDuplicateTables(self):
+        dopass = True
+        while dopass:
+            dopass = False
+            cnt = 0
+            for team in self.teams:
+                cnt += team.countDuplicateTables()
+                if team.minimizeDuplicateTables():
+                    dopass = True
+            print("Minimize dup tables: total =", cnt)
         return
 
     def assignFakeSchedule(self):
