@@ -14,51 +14,68 @@ from random import shuffle, seed
 
 @functools.total_ordering
 class EventTime(object):
-    def __init__(self, startT, tm):
-        self.startT = startT
+    # share startT across all instances
+    eventStartTime = None
+    eventEndTime = None   # integer
+
+    def __init__(self, tm):
         if isinstance(tm, str):
             dt = dateparse(tm)
-            self.minutes = int((dt - startT).total_seconds() // 60)
+            self._minutes = int((dt - self.eventStartTime).total_seconds() // 60)
         else:
-            self.minutes = tm
+            self._minutes = tm
+        if self.eventEndTime is not None:
+            self._minutes = min(self.eventEndTime, self._minutes)
         return
 
-    def __hash__(self):
-        return hash(self.minutes)
+    def __int__(self):
+        return self._minutes
 
-    def __incr__(self, min):
+    def __hash__(self):
+        return hash(self._minutes)
+
+    def __incr__(self, min_incr):
         if type(min) != int:
             raise TypeError
 
-        self.minutes += min
+        val = self._minutes + min_incr
+        if self.eventEndTime is not None:
+            val = min(self.eventEndTime, val)
+        self._minutes = val
         return self
 
-    def __add__(self, min):
-        if type(min) != int:
+    def __add__(self, min_incr):
+        if type(min_incr) != int:
             raise TypeError
 
-        return EventTime(self.startT, self.minutes + min)
+        val = self._minutes + min_incr
+        if self.eventEndTime is not None:
+            val = min(self.eventEndTime, val)
+        return EventTime(val)
 
     def __sub__(self, other):
         if type(other) != type(self):
             raise TypeError
 
-        return self.minutes - other.minutes
+        return self._minutes - other._minutes
 
     def __eq__(self, other):
         if type(other) != type(self):
             raise TypeError("Unsupported type %s" % type(other))
 
-        return self.minutes == other.minutes
+        return self._minutes == other._minutes
 
     def __lt__(self, other):
         if type(other) != type(self):
             raise TypeError
 
-        return self.minutes < other.minutes
+        return self._minutes < other._minutes
 
     def __str__(self):
-        return (self.startT + datetime.timedelta(minutes=self.minutes)).strftime('%H:%M')
+        return (self.eventStartTime + datetime.timedelta(minutes=self._minutes)).strftime('%H:%M')
+
+    def __repr__(self):
+        return "EventTime('%s')" % str(self)
 
 
 class Team(object):
@@ -87,11 +104,11 @@ class Team(object):
     def travelTime(self):
         minTravel = 10000
         prevET = None
-        for evt, slot in sorted(self.schedule, key=lambda e: e[0].startT):
+        for evt, slot in sorted(self.schedule, key=lambda e: e[0].startTime()):
             if prevET is not None:
-                dt = evt.startT - prevET
+                dt = evt.startTime() - prevET
                 minTravel = min(minTravel, dt)
-            prevET = evt.endT
+            prevET = evt.endTime()
         return minTravel
 
     def outputSchedule(self, outCSV):
@@ -104,23 +121,48 @@ class Team(object):
 
 @functools.total_ordering
 class TimeSlot(object):
+    travelTime = 0
+    timeBlockBoundaries = {}
+
     def __init__(self, index, startT, endT):
         self.index = index
-        self.startT = copy.copy(startT)
-        self.endT = copy.copy(endT)
+        self._startT = copy.copy(startT)
+        self._endT = copy.copy(endT)
+        self.extendEnd = 0
         return
+
+    @classmethod
+    def setTimeBlocks(cls, alltimes):
+        cls.timeBlockBoundaries = {t: i for i, t in enumerate(sorted(alltimes))}
+        return
+
+    @classmethod
+    def numTimeBlocks(cls):
+        # 1 less because we are counting regions. timeBlockBoundaries holds the edges
+        return len(cls.timeBlockBoundaries) - 1
+
+    def startTime(self):
+        return self._startT
+
+    def endTime(self, padded=False):
+        if padded:
+            return self._endT + (self.travelTime + self.extendEnd)
+        return self._endT
+
+    def timeBlockRange(self, padded=False):
+        return range(self.timeBlockBoundaries[self._startT], self.timeBlockBoundaries[self.endTime(padded)])
 
     def __eq__(self, other):
         if not isinstance(other, TimeSlot):
             raise TypeError("Unsupported type %s" % type(other))
 
-        return self.startT == other.startT
+        return self._startT == other._startT
 
     def __lt__(self, other):
         if not isinstance(other, TimeSlot):
             raise TypeError
 
-        return self.startT < other.startT
+        return self._startT < other._startT
 
 
 class JudgeEvent(object):
@@ -223,7 +265,6 @@ class JudgeSession(TimeSlot):
         self.event = event
         self.penalty = penalty
         self.teams = len(self.event.rooms) * [None, ]
-        self.extendEnd = 0
         return
 
     def assignTeam(self, team):
@@ -236,16 +277,16 @@ class JudgeSession(TimeSlot):
         raise Exception("Too many teams for judge rooms")
 
     def __str__(self):
-        args = [self.index, self.startT, self.endT, self.event.name]
+        args = [self.index, self.startTime(), self.endTime(), self.event.name]
         args.extend(self.teams)
         return ' '.join([str(x) for x in args])
 
     def outputTeamSchedule(self, slot, outCSV):
         if self.event.subSchedule is not None:
             for subE in self.event.subSchedule[self.event.rooms[slot]]:
-                outCSV.writerow((subE['event'], subE['room'], self.startT+subE['startTM'], self.startT+subE['endTM']))
+                outCSV.writerow((subE['event'], subE['room'], self.startTime() + subE['startTM'], self.startTime() + subE['endTM']))
         else:
-            outCSV.writerow((self.event.name, self.event.rooms[slot], self.startT, self.endT))
+            outCSV.writerow((self.event.name, self.event.rooms[slot], self.startTime(), self.endTime()))
         return
 
     def judgeScheduleEntries(self, entries):
@@ -258,16 +299,16 @@ class JudgeSession(TimeSlot):
                         r1 = {}
                         entries[subE['event']] = r1
 
-                    st = self.startT+subE['startTM']
+                    st = self.startTime() + subE['startTM']
                     r2 = r1.get(st, None)
                     if r2 is None:
-                        r2 = {'StartTime': st, 'EndTime': self.startT+subE['endTM']}
+                        r2 = {'StartTime': st, 'EndTime': self.startTime() + subE['endTM']}
                         r1[st] = r2
                     r2[subE['room']] = t.teamNumber if t is not None else ''
         else:
             if self.event.name not in entries:
                 entries[self.event.name] = {}
-            row = {'StartTime': self.startT, 'EndTime': self.endT}
+            row = {'StartTime': self.startTime(), 'EndTime': self.endTime()}
             for i in range(len(self.teams)):
                 if self.teams[i] is not None:
                     row[self.event.rooms[i]] = self.teams[i].teamNumber
@@ -301,12 +342,12 @@ class MatchList(object):
                 if row['Match'] > 0:
                     outCSV.writerow(row)
                     # be nice and flag breaks
-                    if prevEndTime is not None and m.startT - prevEndTime > self.breakTime:
-                        outCSV.writerow({'Match': '', 'StartTime': prevEndTime, 'EndTime': m.startT, fields[3]: 'Break'})
+                    if prevEndTime is not None and m.startTime() - prevEndTime > self.breakTime:
+                        outCSV.writerow({'Match': '', 'StartTime': prevEndTime, 'EndTime': m.startTime(), fields[3]: 'Break'})
                 row = {'Match': m.matchNum,
-                       'StartTime': m.startT,
-                       'EndTime': m.endT}
-                prevEndTime = m.endT
+                       'StartTime': m.startTime(),
+                       'EndTime': m.endTime()}
+                prevEndTime = m.endTime()
             for i in range(len(m.teams)):
                 if m.teams[i] is not None:
                     row[m.tableName(i)] = m.teams[i].designation()
@@ -321,7 +362,6 @@ class Match(TimeSlot):
         self.matchNum = matchNum
         self.table = table
         # self.penalty = penalty
-        self.extendEnd = 0
         self.teams = [None, None]
         return
 
@@ -344,7 +384,7 @@ class Match(TimeSlot):
         return '{} {}'.format(self.table, slot+1)
 
     def outputTeamSchedule(self, slot, outCSV):
-        outCSV.writerow(('Match {}'.format(self.matchNum), self.tableName(slot), self.startT, self.endT))
+        outCSV.writerow(('Match {}'.format(self.matchNum), self.tableName(slot), self.startTime(), self.endTime()))
         return
 
 
@@ -356,9 +396,10 @@ class ScheduleModel(object):
     modelLineExpr = r'^\s*[0-9]+ (?P<type>match|judge)Assign\[(?P<i1>[^,]+),(?P<i2>[^,]+),(?P<i3>[^,]+)\]\s+(?P<val>[0-9]+)'
 
     def __init__(self, config):
-        self.startTime = dateparse(config['startTime'])
+        EventTime.eventStartTime = dateparse(config['startTime'])
+
         self.eventDuration = 0
-        self.travelTime = config['travelTime']
+        TimeSlot.travelTime = config['travelTime']
 
         self.teams = ScheduleModel._readTeams(config['teams'])
 
@@ -366,8 +407,12 @@ class ScheduleModel(object):
 
         self.hasJudgePenalty = False
         self._createJudgeSessions(config['judgeEvents'])
+        EventTime.eventEndTime = self.eventDuration
 
         self.scheduleBlocks = config.get('scheduleBlocks', None)
+
+        # now that the schedule is defined, find all the time periods
+        self.setTimeBlocks()
 
         return
 
@@ -391,6 +436,20 @@ class ScheduleModel(object):
                 return e
         return None
 
+    def setTimeBlocks(self):
+        alltimes = set()
+        for e in self.judgeEvents.values():
+            for s in e.sessions:
+                alltimes.add(s.startTime())
+                alltimes.add(s.endTime(padded=True))
+
+        for e in self.matchList.matches:
+            alltimes.add(e.startTime())
+            alltimes.add(e.endTime(padded=True))
+
+        TimeSlot.setTimeBlocks(alltimes)
+        return
+
     # ----------------------------------------------------------------------------------------------------
     # Config methods
 
@@ -406,8 +465,8 @@ class ScheduleModel(object):
     def _readBreaks(self, times):
         breaks = []
         for brkSt, brkEt in times:
-            st = EventTime(self.startTime, brkSt)
-            et = EventTime(self.startTime, brkEt)
+            st = EventTime(brkSt)
+            et = EventTime(brkEt)
             breaks.append((st, et))
         return breaks
 
@@ -429,19 +488,19 @@ class ScheduleModel(object):
         breakTimes = self._readBreaks(config['breakTimes'])
 
         if 'resetAfterBreak' in config:
-            resetAfterBreak = [EventTime(self.startTime, t) for t in config['resetAfterBreak']]
+            resetAfterBreak = [EventTime(t) for t in config['resetAfterBreak']]
         else:
             resetAfterBreak = ()
 
         if 'oneFieldOnly' in config:
-            oneFieldOnly = [EventTime(self.startTime, t) for t in config['oneFieldOnly']]
+            oneFieldOnly = [EventTime(t) for t in config['oneFieldOnly']]
         else:
             oneFieldOnly = {}
 
         # ------------------------------
         # compute matches times, names
 
-        startT = EventTime(self.startTime, 0)
+        startT = EventTime(0)
         mLen = config['matchLen']
         dt = mLen + self.matchList.breakTime
 
@@ -477,17 +536,17 @@ class ScheduleModel(object):
                 tblSet = (tblSet + 1) % nTableSets
 
         print('Matches end at {}'.format(startT), file=sys.stderr)
-        self.eventDuration = max(self.eventDuration, startT.minutes)
+        self.eventDuration = max(self.eventDuration, int(startT))
 
         if 'extendSessions' in config:
             # extend over breaks so teams have decent amount of time
             # can help if breaks don't happen because of overruns
             for st, et, delT in config['extendSessions']:
-                startT1 = EventTime(self.startTime, st)
-                endT1 = EventTime(self.startTime, et)
+                startT1 = EventTime(st)
+                endT1 = EventTime(et)
 
                 for m in self.matchList.matches:
-                    if m.startT >= startT1 and m.startT < endT1:
+                    if m.startTime() >= startT1 and m.startTime() < endT1:
                         m.extendEnd = delT
 
         return
@@ -502,7 +561,7 @@ class ScheduleModel(object):
             event.rooms = judgeInfo['rooms']
 
             breakTimes = self._readBreaks(judgeInfo['breakTimes'])
-            startT = EventTime(self.startTime, 0)
+            startT = EventTime(0)
             sLen = judgeInfo['sessionLen']
             dt = sLen + judgeInfo['sessionBreak']
 
@@ -527,8 +586,8 @@ class ScheduleModel(object):
 
             if 'extendSessions' in judgeInfo:
                 # extend over lunch so teams have decent amount of time
-                st = EventTime(self.startTime, judgeInfo['extendSessions'][0])
-                et = EventTime(self.startTime, judgeInfo['extendSessions'][1])
+                st = EventTime(judgeInfo['extendSessions'][0])
+                et = EventTime(judgeInfo['extendSessions'][1])
                 delT = judgeInfo['extendSessions'][2]
 
                 for jS in event.sessions:
@@ -540,7 +599,7 @@ class ScheduleModel(object):
 
             eventIndex += 1
             print('Judge {} ends at {}'.format(judgeInfo['name'], startT), file=sys.stderr)
-            self.eventDuration = max(self.eventDuration, startT.minutes)
+            self.eventDuration = max(self.eventDuration, int(startT))
 
         return
 
@@ -570,7 +629,7 @@ class ScheduleModel(object):
         print('param nJudgeSessions{en in judgeEvents};')
         print('set judgeSessions{en in judgeEvents} := 1 .. nJudgeSessions[en];')
 
-        print('set times := 0 .. %d;' % self.eventDuration)
+        print('set times := 0 .. %d;' % (TimeSlot.numTimeBlocks() - 1))
 
         print()
         print('var matchAssign{m in matches, t1 in teams, t2 in t1+1 .. %d}, binary;' % maxTeams)
@@ -657,15 +716,15 @@ class ScheduleModel(object):
         print()
         index = 0
         for st, et, judgeEvts in self.scheduleBlocks:
-            startT = EventTime(self.startTime, st)
-            endT = EventTime(self.startTime, et)
+            startT = EventTime(st)
+            endT = EventTime(et)
 
             startMatch = None
             endMatch = None
             for m in self.matchList.matches:
-                if startMatch is None and m.startT >= startT:
+                if startMatch is None and m.startTime() >= startT:
                     startMatch = m.index
-                if m.endT <= endT:
+                if m.endTime() <= endT:
                     endMatch = m.index
             if startMatch is not None and endMatch is None:
                 endMatch = self.matches.matchList[-1].index
@@ -679,9 +738,9 @@ class ScheduleModel(object):
                 endSess = None
                 evtIndex = self.judgeEvents[m].index
                 for s in self.judgeEvents[m].sessions:
-                    if startSess is None and s.startT >= startT:
+                    if startSess is None and s.startTime() >= startT:
                         startSess = s.index
-                    if s.endT <= endT:
+                    if s.endTime() <= endT:
                         endSess = s.index
                 if startSess is not None:
                     if startSess == endSess:
@@ -751,9 +810,7 @@ class ScheduleModel(object):
         first = True
         for name, event in self.judgeEvents.items():
             for s in event.sessions:
-                for t in range(s.startT.minutes, s.endT.minutes + self.travelTime + s.extendEnd + 1):
-                    if t > self.eventDuration:
-                        break
+                for t in s.timeBlockRange(padded=True):
                     if not first:
                         print(',')
                     print("      [%d,%d,%d] 1" % (event.index, s.index, t), end='')
@@ -763,9 +820,7 @@ class ScheduleModel(object):
         print('param matchTimes :=')
         first = True
         for match in self.matchList.matches:
-            for t in range(match.startT.minutes, match.endT.minutes + self.travelTime + match.extendEnd + 1):
-                if t > self.eventDuration:
-                    break
+            for t in match.timeBlockRange(padded=True):
                 if not first:
                     print(',')
                 print("      [%d,%d] 1" % (match.index, t), end='')
